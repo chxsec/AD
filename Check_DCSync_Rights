@@ -79,6 +79,3 @@ function Test-DCSyncRights {
         Write-Host "`nNote: your token contains high-priv groups (Domain Admins/Enterprise Admins/Administrators) which normally grant replication rights." -ForegroundColor Cyan
     }
 }
-
-# Run it
-Test-DCSyncRights
