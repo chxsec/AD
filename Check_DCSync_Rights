@@ -1,0 +1,84 @@
+function Test-DCSyncRights {
+    [CmdletBinding()]
+    param()
+
+    $dcGetChangesGuid       = [Guid] "1131f6aa-9c07-11d1-f79f-00c04fc2dcd2"  # DS-Replication-Get-Changes
+    $dcGetChangesAllGuid    = [Guid] "1131f6ad-9c07-11d1-f79f-00c04fc2dcd2"  # DS-Replication-Get-Changes-All
+    $guids = @($dcGetChangesGuid, $dcGetChangesAllGuid)
+
+    # Get current user identity and groups
+    $wi = [System.Security.Principal.WindowsIdentity]::GetCurrent()
+    $currentName = $wi.Name
+    $groupNames = @()
+    try {
+        $groupNames = $wi.Groups | ForEach-Object { $_.Translate([System.Security.Principal.NTAccount]).Value } -ErrorAction SilentlyContinue
+    } catch {
+        # fallback: try whoami /groups parse
+        $groupNames = (whoami /groups) -split "`n" | ForEach-Object { $_.Trim() } | Where-Object {$_ -match "\\"} 
+    }
+    $groupSet = $groupNames | Sort-Object -Unique
+
+    # Try using System.DirectoryServices first (works without AD: drive)
+    try {
+        $domain = [System.DirectoryServices.ActiveDirectory.Domain]::GetCurrentDomain()
+        $root = $domain.GetDirectoryEntry()
+    } catch {
+        Write-Error "Unable to locate current domain via .NET: $($_.Exception.Message)"
+        return
+    }
+
+    try {
+        $acl = $root.ObjectSecurity
+        $rules = $acl.GetAccessRules($true, $true, [System.Security.Principal.NTAccount])
+    } catch {
+        Write-Error "Failed to read access rules from domain root: $($_.Exception.Message)"
+        return
+    }
+
+    $matching = @()
+    foreach ($r in $rules) {
+        # ObjectType may be [Guid] or an empty guid — compare against our GUIDs
+        if ($r.ObjectType -and ($guids -contains [Guid]$r.ObjectType)) {
+            $matching += [PSCustomObject]@{
+                IdentityReference     = $r.IdentityReference.Value
+                ActiveDirectoryRights = $r.ActiveDirectoryRights
+                ObjectType            = [Guid]$r.ObjectType
+                IsInherited           = $r.IsInherited
+            }
+        }
+    }
+
+    if ($matching.Count -eq 0) {
+        Write-Output "No ACEs found on the domain root for DS-Replication-Get-Changes or DS-Replication-Get-Changes-All."
+        return
+    }
+
+    Write-Output "Found the following ACEs granting replication extended rights on the domain root:`n"
+    $matching | Format-Table -AutoSize
+
+    # Now check if current user or any of their groups is present in the ACEs
+    $matchingIdentities = $matching.IdentityReference | Sort-Object -Unique
+    $has = $false
+    foreach ($id in $matchingIdentities) {
+        if ($id -ieq $currentName) { $has = $true; break }
+        if ($groupSet -contains $id) { $has = $true; break }
+        # also handle 'DOMAIN\Group' vs 'BUILTIN\Administrators' casing differences -- we've compared case-insensitive
+    }
+
+    if ($has) {
+        Write-Host "`n✅ Your current user or one of your groups appears in those ACEs — you likely have DCSync rights." -ForegroundColor Green
+        # Provide specific matches
+        $matching | Where-Object { $groupSet -contains $_.IdentityReference -or $_.IdentityReference -ieq $currentName } |
+            Format-Table -AutoSize
+    } else {
+        Write-Host "`n❌ Your user and groups do NOT appear in those ACEs." -ForegroundColor Yellow
+    }
+
+    # Extra note: membership in Domain Admins / Enterprise Admins / Administrators also implies DCSync in many environments.
+    if ($groupSet -match "Domain Admins|Enterprise Admins|Administrators") {
+        Write-Host "`nNote: your token contains high-priv groups (Domain Admins/Enterprise Admins/Administrators) which normally grant replication rights." -ForegroundColor Cyan
+    }
+}
+
+# Run it
+Test-DCSyncRights
